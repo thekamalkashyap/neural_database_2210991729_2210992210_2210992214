@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# --- CONFIGURATION ---
+if [ -z "$DONTFORGET_API_URL" ]; then
+    echo -e "\033[0;31mError: DONTFORGET_API_URL is not set.\033[0m"
+    exit 1
+fi
+if [ -z "$DONTFORGET_SECRET_KEY" ]; then
+    echo -e "\033[0;31mError: DONTFORGET_SECRET_KEY is not set.\033[0m"
+    exit 1
+fi
+API_URL="$DONTFORGET_API_URL"
+API_KEY="$DONTFORGET_SECRET_KEY"
+
+# --- COLORS ---
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+COMMAND=$1
+INPUT=$2
+EXTRA=$3
+
+case $COMMAND in
+    remember|save|r)
+        if [ -z "$INPUT" ]; then
+            TEMP_FILE=$(mktemp)
+            ${EDITOR:-vim} "$TEMP_FILE"
+            CONTENT=$(cat "$TEMP_FILE")
+            rm "$TEMP_FILE"
+            if [ -z "$CONTENT" ]; then echo -e "${RED}Aborted.${NC}"; exit 1; fi
+        else
+            CONTENT="$INPUT"
+        fi
+
+        echo -e "${BLUE}🧠 Saving...${NC}"
+        JSON_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1]}))" "$CONTENT")
+
+        RESPONSE=$(curl -s -X POST "$API_URL/remember" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+        STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null)
+        if [ "$STATUS" == "saved" ]; then
+            TAGS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(', '.join(json.load(sys.stdin).get('tags',[])))" 2>/dev/null)
+            SPO=$(echo "$RESPONSE" | python3 -c "import sys,json; ts=json.load(sys.stdin).get('triplets',[]); [print(f'  ({t[\"subject\"]}) —[{t[\"predicate\"]}]→ ({t[\"object\"]})') for t in ts]" 2>/dev/null)
+            echo -e "${GREEN}✔ Saved!${NC}"
+            echo -e "${YELLOW}Tags:${NC} $TAGS"
+            if [ -n "$SPO" ]; then
+                echo -e "${CYAN}SPO Triplets:${NC}"
+                echo "$SPO"
+            fi
+        else
+            echo -e "${RED}✘ Error:${NC} $RESPONSE"
+        fi
+        ;;
+
+    ask|remind|q)
+        if [ -z "$INPUT" ]; then echo -e "${RED}Missing query.${NC}"; exit 1; fi
+        echo -e "${BLUE}🔍 Thinking...${NC}"
+
+        JSON_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'question': sys.argv[1]}))" "$INPUT")
+
+        RESPONSE=$(curl -s -X POST "$API_URL/remind" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+        ANSWER=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('answer','Server Error'))" 2>/dev/null)
+        STATS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin).get('stats',{}); print(f'{d.get(\"found\",0)} records | {d.get(\"tokens\",0)} tokens')" 2>/dev/null)
+
+        echo -e "\n${GREEN}$ANSWER${NC}\n"
+        echo -e "${BLUE}────────────────────────────────${NC}"
+        echo -e "${YELLOW}📊 Stats: $STATS${NC}\n"
+        ;;
+
+    delete|d)
+        if [ -z "$INPUT" ]; then echo -e "${RED}Missing query.${NC}"; exit 1; fi
+
+        JSON_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'question': sys.argv[1]}))" "$INPUT")
+        RESPONSE=$(curl -s -X POST "$API_URL/delete" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+        ANSWER=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('answer','Error'))" 2>/dev/null)
+        echo -e "\n${GREEN}$ANSWER${NC}\n"
+        ;;
+
+    edit|e)
+        # Knowledge editing: mem e "query to find" "new corrected value"
+        if [ -z "$INPUT" ] || [ -z "$EXTRA" ]; then
+            echo -e "${RED}Usage: mem e \"query to match\" \"new value\"${NC}"
+            exit 1
+        fi
+
+        JSON_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'query': sys.argv[1], 'new_value': sys.argv[2]}))" "$INPUT" "$EXTRA")
+        RESPONSE=$(curl -s -X POST "$API_URL/edit" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+        STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null)
+        if [ "$STATUS" == "edit_stored" ]; then
+            echo -e "${GREEN}✔ Knowledge edit stored.${NC}"
+        else
+            echo -e "${RED}✘ Error:${NC} $RESPONSE"
+        fi
+        ;;
+
+    sql)
+        # T2SQL: mem sql "question" "/path/to/database.db"
+        if [ -z "$INPUT" ]; then echo -e "${RED}Missing question.${NC}"; exit 1; fi
+        DB_FILE="${EXTRA:-}"
+        if [ -z "$DB_FILE" ]; then
+            echo -e "${RED}Usage: mem sql \"question\" \"/path/to/db.db\"${NC}"
+            exit 1
+        fi
+
+        echo -e "${BLUE}🔮 Generating SQL...${NC}"
+        JSON_PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'question': sys.argv[1], 'db_path': sys.argv[2]}))" "$INPUT" "$DB_FILE")
+
+        RESPONSE=$(curl -s -X POST "$API_URL/t2sql" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+        THOUGHT=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('thought',''))" 2>/dev/null)
+        SQL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sql',''))" 2>/dev/null)
+        COUNT=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('count','0'))" 2>/dev/null)
+        ERROR=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+
+        echo -e "\n${CYAN}💭 Thought:${NC} $THOUGHT"
+        echo -e "${YELLOW}📝 SQL:${NC} $SQL"
+        if [ -n "$ERROR" ] && [ "$ERROR" != "None" ] && [ "$ERROR" != "" ]; then
+            echo -e "${RED}⚠ SQL Error:${NC} $ERROR"
+        else
+            echo -e "${GREEN}✔ $COUNT rows returned${NC}"
+            echo "$RESPONSE" | python3 -c "
+import sys,json
+rows=json.load(sys.stdin).get('rows',[])
+for r in rows[:20]:
+    print('  ', r)
+" 2>/dev/null
+        fi
+        echo ""
+        ;;
+
+    *)
+        echo -e "${CYAN}DontForget — Neural Database CLI${NC}"
+        echo ""
+        echo "Usage: mem <command> [args]"
+        echo ""
+        echo "  r  \"text\"                  Remember a thought"
+        echo "  q  \"question\"              Query memories"
+        echo "  d  \"description\"           Delete matching memories"
+        echo "  e  \"query\" \"new value\"     Edit a stored fact (gating)"
+        echo "  sql \"question\" \"db.db\"     Natural language → SQL"
+        exit 1
+        ;;
+esac
